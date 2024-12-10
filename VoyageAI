@@ -1,0 +1,76 @@
+from langchain_voyageai import VoyageAIEmbeddings
+import os
+import numpy as np
+from numpy import dot
+from numpy.linalg import norm
+import io  # BytesIO 변환을 위해 import
+import streamlit as st
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from dotenv import load_dotenv
+
+# 환경 변수 로드
+load_dotenv("text파일명")
+api_key = os.getenv("VOYAGE_API_KEY")
+
+# VoyageAI 임베딩 인스턴스 설정
+embeddings = VoyageAIEmbeddings(
+    voyage_api_key=api_key, model="voyage-3"
+)
+
+# Streamlit UI 구성
+st.title("VoyageAI 기반 QA 시스템")
+st.write("PDF 문서를 로드하여 검색합니다.")
+
+# PDF 파일 경로 (사용자가 로드한 파일)
+pdf_filepath = "긁어올 파일명"
+
+# 검색창만 표시
+query = st.text_input("질문을 입력하세요:")
+
+if query:
+    try:
+        # PDF 로드
+        pdf_loader = PyPDFLoader(pdf_filepath)
+        with st.spinner("PDF 문서 처리 중..."):
+            pages = pdf_loader.load()  # PDF 전체 텍스트 로드
+
+            # 텍스트 분할기 설정
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=400,
+                chunk_overlap=200
+            )
+
+            # 텍스트 분할
+            documents = text_splitter.split_text(" ".join([page.page_content for page in pages]))
+
+            # 문서 임베딩 생성
+            with st.spinner("문서 임베딩 중..."):
+                documents_embds = embeddings.embed_documents(documents)
+
+            # 쿼리 임베딩 생성
+            with st.spinner("Query 임베딩 계산 중..."):
+                query_embd = embeddings.embed_query(query)
+
+            # 가장 높은 유사도를 가진 문서 찾기
+            max_similarity = -1
+            best_document = None
+            for idx, doc_embd in enumerate(documents_embds):
+                try:
+                    # 코사인 유사도 계산
+                    score = dot(query_embd, doc_embd) / (norm(query_embd) * norm(doc_embd))
+                    if score > max_similarity:
+                        max_similarity = score
+                        best_document = documents[idx]
+                except Exception as e:
+                    st.error(f"유사도 계산 중 오류: {e}")
+
+            # 결과 출력
+            if best_document is not None:
+                st.write("### 검색 결과")
+                st.write(f"**문서 내용:** {best_document}")
+                st.write(f"**유사도 점수:** {max_similarity:.4f}")
+            else:
+                st.write("검색 결과가 없습니다.")
+    except Exception as e:
+        st.error(f"PDF 처리 중 오류 발생: {e}")
