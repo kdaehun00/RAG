@@ -1,0 +1,90 @@
+import streamlit as st
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
+from sentence_transformers.util import cos_sim
+
+# Mean pooling 함수
+def mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output[0]
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+# 디바이스 설정
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# 모델 초기화
+model_id = 'nomic-ai/nomic-embed-text-v1.5'
+tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+model = AutoModel.from_pretrained(model_id, trust_remote_code=True, safe_serialization=True)
+model.eval().to(device)
+
+# Matryoshka 차원 설정
+matryoshka_dim = 512
+
+# Streamlit UI 구성
+st.title("VoyageAI 기반 QA 시스템")
+st.write("PDF 문서를 로드하여 검색합니다.")
+
+# PDF 파일 경로 (사용자가 로드한 파일)
+pdf_filepath = "KB.pdf"
+
+# 검색창 표시
+query = st.text_input("질문을 입력하세요:")
+
+if query:
+    try:
+        # PDF 로드
+        pdf_loader = PyPDFLoader(pdf_filepath)
+        with st.spinner("PDF 문서 처리 중..."):
+            docs = pdf_loader.load()
+            full_text = " ".join([page.page_content for page in docs])  # 모든 텍스트 결합
+
+            # 텍스트 분할기 설정
+            # 청크를 더 작게 나누기 위해 chunk_size와 chunk_overlap 값을 조정
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size = 100, chunk_overlap=50)
+            split_docs = text_splitter.split_text(full_text)
+
+            # 만약 청크가 너무 많다면 최대 개수를 제한
+            max_chunks = 50  # 예제: 최대 50개의 청크만 고려
+            split_docs = split_docs[:max_chunks]
+
+            # 입력 인코딩
+            queries = [f"search_query: {doc}" for doc in split_docs]
+            encoded_input = tokenizer(queries, padding=True, truncation=True, max_length=512, return_tensors='pt').to(device)
+
+            # 모델 실행 및 임베딩 추출
+            with torch.no_grad():
+                model_output = model(**encoded_input)
+                embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
+                embeddings = F.layer_norm(embeddings, normalized_shape=(embeddings.shape[1],))
+                embeddings = embeddings[:, :matryoshka_dim]
+                embeddings = F.normalize(embeddings, p=2, dim=1)
+
+            # 검색 질의 임베딩
+            query_input = tokenizer([f"search_query: {query}"], padding=True, truncation=True, max_length=512, return_tensors='pt').to(device)
+            with torch.no_grad():
+                query_output = model(**query_input)
+                query_embedding = mean_pooling(query_output, query_input['attention_mask'])
+                query_embedding = F.layer_norm(query_embedding, normalized_shape=(query_embedding.shape[1],))
+                query_embedding = query_embedding[:, :matryoshka_dim]
+                query_embedding = F.normalize(query_embedding, p=2, dim=1)
+
+            # 유사도 계산
+            similarities = cos_sim(query_embedding, embeddings)
+
+            # 상위 N개의 문서를 가져오기
+            top_n = 5  # 결과 상위 5개를 출력
+            top_indices = torch.topk(similarities, k=top_n).indices[0].tolist()
+            for idx, similarity_idx in enumerate(top_indices):
+                st.write(f"결과 {idx + 1}:")
+                st.info(f"유사도: {similarities[0, similarity_idx].item():.4f}")
+                st.write(split_docs[similarity_idx])
+
+    except Exception as e:
+        st.error(f"PDF 처리 중 오류 발생: {e}")
+        st.error("자세한 디버깅 정보:")
+        st.exception(e)
