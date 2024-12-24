@@ -1,0 +1,120 @@
+import os
+import pandas as pd
+import numpy as np
+from numpy import dot
+from numpy.linalg import norm
+import ast
+import openai
+from openai import OpenAI
+import streamlit as st
+from streamlit_chat import message
+from dotenv import load_dotenv
+
+load_dotenv('app.env')
+
+# Set OpenAI API key
+openai.api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI()
+
+def get_embedding(text, engine):
+    text = text.replace("\n", " ")
+    return client.embeddings.create(input = [text], model=engine).data[0].embedding
+
+# Load data
+folder_path = './data'
+file_name = 'embedding.csv'
+file_path = os.path.join(folder_path, file_name)
+
+# 만약 파일이 있으면 로드
+if os.path.isfile(file_path):
+    print(f"{file_name} 파일이 존재합니다")
+    df = pd.read_csv(file_path)
+    # 'embedding' 컬럼에 있는 모든 문자열 데이터를 파이썬의 리스트나 딕셔너리 등의 실제 형태로 변환
+    df['embedding'] = df['embedding'].apply(ast.literal_eval)
+# 파일이 없으면 새로 생성
+else:
+    folder_path = './data'
+    # 폴더 및 모든 파일 중 txt파일만 리스트로 가져와서 for 문 시작
+    txt_file_name = [file for file in os.listdir(folder_path) if file.endswith('.txt')]
+
+    data = []
+
+    for file in txt_file_name:
+        txt_file_path = os.path.join(folder_path, file)
+        with open(txt_file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+            data.append(text)
+
+    df = pd.DataFrame(data, columns=['text'])
+    df['embedding'] = df.apply(lambda row: get_embedding(row.text, engine="text-embedding-ada-002"), axis=1)
+
+    # 파일로 저장
+    df.to_csv(file_path, index=False, encoding='utf-8')
+
+def cos_sim(A, B):
+    return dot(A, B)/(norm(A)*norm(B))
+
+def return_answer_candidate(df, query):
+    query_embedding = get_embedding(
+        query,
+        engine="text-embedding-ada-002"
+    )
+    # 입력된 질문과 각 문서의 유사도
+    df['similarity'] = df['embedding'].apply(lambda x: cos_sim(np.array(query_embedding), np.array(x)))
+    # 유사도 높은 순으로 정렬
+    top3 = df.sort_values("similarity", ascending=False).head(3)
+    return top3
+
+def create_prompt(df, query):
+    # 질문과 가장 유사한 문서 3개 가져오기
+    result = return_answer_candidate(df, query)
+    system_message = f"""
+    너는 주어진 문서를 참고해서, 자세하게 대답해줘.
+    문서내용:
+    문서1: """ + str(result.iloc[0]['text']) + """
+    문서2: """ + str(result.iloc[1]['text']) + """
+    문서3: """ + str(result.iloc[2]['text']) + """
+    한국어로 답변해주고, 문서에 기반에서 정확한 답을 해줘
+    """
+
+    user_message = f"""User question: "{str(query)}". """
+
+    messages =[
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": user_message}
+    ]
+    print(result)
+    return messages
+
+# 완성된 질문에 대한 답변 생성
+def generate_response(messages):
+    result = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=messages,
+        temperature=0.4,
+        max_tokens=500)
+    print(result.choices[0].message.content)
+    return result.choices[0].message.content
+
+
+if 'generated' not in st.session_state:
+    st.session_state['generated'] = []
+
+if 'past' not in st.session_state:
+    st.session_state['past'] = []
+
+with st.form('form', clear_on_submit=True):
+    user_input = st.text_input('물어보세요!', '', key='input')
+    submitted = st.form_submit_button('Send')
+
+if submitted and user_input:
+    # 프롬프트 생성 후 프롬프트를 기반으로 챗봇의 답변을 반환
+    prompt = create_prompt(df, user_input)
+    chatbot_response = generate_response(prompt)
+    st.session_state['past'].append(user_input)
+    st.session_state["generated"].append(chatbot_response)
+
+if st.session_state['generated']:
+    for i in reversed(range(len(st.session_state['generated']))):
+        message(st.session_state['past'][i], is_user=True, key=str(i) + '_user')
+        message(st.session_state["generated"][i], key=str(i))
